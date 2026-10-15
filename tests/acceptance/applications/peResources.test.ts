@@ -114,8 +114,57 @@ const expectPeInventoriesAcrossAdapters = async (
       `resource${plus ? "64" : "32"}${empty ? "-empty" : ""}.exe`,
     );
     await writeFile(path, fixture.bytes);
+    if (!empty) {
+      for (const [maxFileBytes, maxEntries, resource] of [
+        [64, 16384, "file-size"],
+        [fixture.bytes.length, 1, "memory"],
+      ] as const) {
+        const rejected = await cli.run({
+          arguments: [
+            "inspect-pe-resources",
+            path,
+            "--max-file-bytes",
+            String(maxFileBytes),
+            "--max-entries",
+            String(maxEntries),
+            "--json",
+          ],
+        });
+        expect(rejected.exitCode).toBe(1);
+        expect(rejected.json).toMatchObject({
+          code: "resource_constraint",
+          details: {
+            resource,
+            reported_limits: {
+              max_file_bytes: maxFileBytes,
+              max_entries: maxEntries,
+            },
+          },
+        });
+        if (resource === "file-size")
+          expect(rejected.json).toMatchObject({
+            remediation: { action: expect.stringContaining("max_file_bytes") },
+          });
+        const response = await client.callTool({
+          name: contract.name,
+          arguments: {
+            path,
+            max_file_bytes: maxFileBytes,
+            max_entries: maxEntries,
+          },
+        });
+        expect(response.isError).toBe(true);
+        expect(parseMcpToolError(response)).toEqual({ error: rejected.json });
+      }
+    }
     const result = await cli.run({
-      arguments: ["inspect-pe-resources", path, "--json"],
+      arguments: [
+        "inspect-pe-resources",
+        path,
+        "--max-file-bytes",
+        String(fixture.bytes.length),
+        "--json",
+      ],
     });
     expect(result.exitCode).toBe(0);
     const evidence = contract.outputSchema.parse(result.json);
@@ -154,7 +203,7 @@ const expectPeInventoriesAcrossAdapters = async (
     ]);
     const response = await client.callTool({
       name: contract.name,
-      arguments: { path },
+      arguments: { path, max_file_bytes: fixture.bytes.length },
     });
     expect(response.isError).not.toBe(true);
     const mcp = contract.outputSchema.parse(response.structuredContent);
@@ -230,7 +279,6 @@ cliTest(
         coverage: { status: "complete", resources: 0 },
       });
       for (const arguments_ of [
-        { path, max_file_bytes: 64 },
         { path: "relative.exe" },
         { path, extra: true },
       ]) {

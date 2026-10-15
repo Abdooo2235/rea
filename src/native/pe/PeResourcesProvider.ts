@@ -28,6 +28,7 @@ export class PeResourcesProvider implements PeResourcesPort {
   }
 
   async inspect(input: InspectPeResourcesInput, options?: ExecutionOptions) {
+    let phase: "read" | "parse" = "read";
     try {
       const snapshot = await this.#resources.run(() =>
         readStableArtifact(
@@ -38,6 +39,7 @@ export class PeResourcesProvider implements PeResourcesPort {
           this.#resources,
         ),
       );
+      phase = "parse";
       return ok(
         await parsePeResources(
           snapshot.bytes,
@@ -51,7 +53,7 @@ export class PeResourcesProvider implements PeResourcesPort {
         ),
       );
     } catch (cause) {
-      return err(peResourcesFailure(cause, input, options?.signal));
+      return err(peResourcesFailure(cause, input, options?.signal, phase));
     }
   }
 }
@@ -60,6 +62,7 @@ const peResourcesFailurePrimary = (
   cause: unknown,
   input: InspectPeResourcesInput,
   signal: AbortSignal | undefined,
+  phase: "read" | "parse",
 ) => {
   const operation = "inspect_pe_resources";
   if (cause instanceof ArtifactReaderFailure && cause.reason === "integrity")
@@ -77,13 +80,21 @@ const peResourcesFailurePrimary = (
     if (cause.reason === "limit")
       return new AnalysisResourceConstraintError(
         operation,
-        "memory",
+        phase === "read" ? "file-size" : "memory",
         cause.message,
         {
           max_file_bytes: input.max_file_bytes,
           max_entries: input.max_entries,
         },
-        { cause },
+        {
+          cause,
+          ...(phase === "read"
+            ? {
+                remediationAction:
+                  "Select a smaller PE image or increase max_file_bytes within its supported range to admit the selected input.",
+              }
+            : {}),
+        },
       );
     if (cause.reason === "path" || cause.reason === "format")
       return new AnalysisInputError(operation, { cause }, [
@@ -123,8 +134,9 @@ const peResourcesFailure = (
   cause: unknown,
   input: InspectPeResourcesInput,
   signal: AbortSignal | undefined,
+  phase: "read" | "parse",
 ) => {
-  const primary = peResourcesFailurePrimary(cause, input, signal);
+  const primary = peResourcesFailurePrimary(cause, input, signal, phase);
   if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
     return primary;
   const cleanup = new ProviderCleanupError(
