@@ -56,3 +56,33 @@ it("classifies overloaded open calls from lexical receiver facts", async () => {
   expect(endpoints).toEqual(["/api", "/dav", "/shadowed-parent"]);
   expect(storage).toEqual(["indexed-db"]);
 });
+
+it("requires SQLite module identity before emitting storage observations", async () => {
+  const inputPath = await createTestTempDirectory("rea-js-sqlite-identity-");
+  await writeFile(
+    join(inputPath, "app.js"),
+    `
+      class Database { constructor(name) { this.name = name; } }
+      console.log(new Database("hello"));
+      const sqlite = require("sqlite3");
+      new sqlite.Database("fixture.db");
+    `,
+  );
+  const result = await analyzeJavaScriptApplication({
+    input_path: inputPath,
+    format: "directory",
+  });
+  if (!result.ok)
+    throw new Error(`Expected analysis success: ${result.error.message}`);
+  const { graph } = javascriptApplicationAnalysisResultSchema.parse(
+    result.value.normalized_result,
+  );
+  const storage = graph.nodes
+    .filter(({ kind }) => kind === "storage")
+    .flatMap(({ observations }) => observations);
+  expect(storage).toHaveLength(1);
+  expect(storage[0]).toMatchObject({
+    properties: { storage_kind: "sqlite", name: "fixture.db" },
+    evidence: { state: "observed", confidence: "exact" },
+  });
+});

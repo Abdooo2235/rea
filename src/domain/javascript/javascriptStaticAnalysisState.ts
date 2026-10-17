@@ -51,6 +51,8 @@ export interface JavaScriptAnalysisAccumulator {
     readonly name: string;
   }[];
   readonly storage: LocatedJavaScriptFinding<JavaScriptStaticStorage>[];
+  /** Module-backed constructors held until shared member-mutation facts are ready. */
+  readonly pendingSqliteCalls: JavaScriptAnalysisAccumulator["pendingNetworkCalls"];
   readonly roles: LocatedJavaScriptFinding<JavaScriptRolePath>[];
   readonly sourceMaps: JavaScriptStaticAnalysis["source_map_urls"][number][];
   readonly registrations: JavaScriptBundlerRegistration[];
@@ -117,6 +119,7 @@ export const createJavaScriptAnalysisAccumulator = (
   endpoints: [],
   pendingNetworkCalls: [],
   storage: [],
+  pendingSqliteCalls: [],
   roles: [],
   sourceMaps: [],
   registrations: [],

@@ -42,12 +42,21 @@ import {
   isUnmodifiedGlobalReference,
   isUnmodifiedImportMetaUrl,
 } from "./javascriptSemanticAmbientWrites.js";
-import { evaluateSemanticExpression } from "./javascriptSemanticValues.js";
-import { semanticTopLevelEffectFollowsCapture } from "./javascriptSemanticMutationInitializers.js";
+import {
+  evaluateSemanticExpression,
+  evaluateSemanticProvenance,
+  evaluateSemanticProvenanceAtRead,
+} from "./javascriptSemanticValues.js";
+import {
+  semanticEffectTiming,
+  semanticTopLevelEffectFollowsCapture,
+} from "./javascriptSemanticMutationInitializers.js";
+import { semanticPropertyPathKeyMatches } from "./javascriptSemanticPropertyPaths.js";
 import {
   semanticFactoryLoaderMemberAt,
   semanticFactoryRequireLoaderAt,
   semanticRequireLoaderAt,
+  semanticMemberChain,
 } from "./javascriptSemanticRequireOrigin.js";
 
 type JavaScriptCallLike =
@@ -124,7 +133,7 @@ export const inspectCall = (
       specifier: moduleUrlSpecifier(node, bindings),
     });
   inspectEndpointCall(node, name, first, context, bindings);
-  inspectStorageCall(node, name, first, context);
+  inspectStorageCall(node, name, first, context, bindings);
   if (first === "audio" || first === "video")
     noteMediaElementPreloads(node, accumulator);
   if (
@@ -746,6 +755,7 @@ const inspectStorageCall = (
   name: string,
   first: string | undefined,
   context: FindingContext,
+  bindings: JavaScriptSemanticAnalysisState,
 ): void => {
   const receiverFact = context.openReceiverFacts?.get(node.start ?? -1);
   const storage =
@@ -758,7 +768,143 @@ const inspectStorageCall = (
         : receiverFact === "cache-storage"
           ? "cache-storage"
           : storageKind(name);
-  if (storage === undefined) return;
+  if (storage === undefined) {
+    if (
+      (name === "Database" || name.endsWith(".Database")) &&
+      isSqliteConstructor(node.callee, bindings)
+    )
+      context.accumulator.pendingSqliteCalls.push({ node, name });
+    return;
+  }
+  addStorage(context, node, name, storage, first);
+};
+
+const isSqliteConstructor = (
+  callee: t.Node,
+  bindings: JavaScriptSemanticAnalysisState,
+): boolean => {
+  const chain = semanticMemberChain(callee);
+  if (chain === undefined || !t.isIdentifier(chain.root)) return false;
+  const binding = resolveSemanticBindingState(
+    bindings,
+    chain.root,
+    chain.root.name,
+  );
+  if (binding === undefined) return false;
+  const provenance = evaluateSemanticProvenanceAtRead(
+    binding,
+    chain.root,
+    bindings,
+  );
+  if (provenance.status !== "module") return false;
+  const [origin] = provenance.origins;
+  const path = [...origin.importedPath, ...chain.members];
+  if (path[0] === "default") path.shift();
+  return origin.specifier === "sqlite3"
+    ? path.length === 1 && path[0] === "Database"
+    : origin.specifier === "better-sqlite3" && path.length === 0;
+};
+
+/** A module origin alone cannot prove a mutable constructor member stayed intact. */
+export const finishSqliteStorage = (
+  context: FindingContext,
+  bindings: JavaScriptSemanticAnalysisState,
+  index: JavaScriptBindingIndex,
+): void => {
+  if (context.accumulator.pendingSqliteCalls.length === 0) return;
+  const moduleWrites = [...bindings.bindingsById.values()].flatMap(
+    (binding) => {
+      const effects = [...binding.memberWrites, ...binding.escapedPaths];
+      if (effects.length === 0) return [];
+      return evaluateSemanticProvenance(binding, bindings).origins.flatMap(
+        (origin) => {
+          if (origin.specifier !== "sqlite3") return [];
+          const imported =
+            origin.importedPath[0] === "default"
+              ? origin.importedPath.slice(1)
+              : origin.importedPath;
+          return effects
+            .filter((effect) => {
+              const path = [...imported, ...effect.path];
+              const first = path[0];
+              return (
+                first === undefined ||
+                semanticPropertyPathKeyMatches(first, "Database")
+              );
+            })
+            .map((effect) => effect.node);
+        },
+      );
+    },
+  );
+  for (const { node, name } of context.accumulator.pendingSqliteCalls) {
+    if (
+      sqliteConstructorUnchanged(
+        node.callee,
+        node,
+        bindings,
+        index,
+        moduleWrites,
+      )
+    )
+      addStorage(context, node, name, "sqlite", stringValue(node.arguments[0]));
+  }
+  context.accumulator.pendingSqliteCalls.length = 0;
+  context.accumulator.storage.sort((left, right) => left.offset - right.offset);
+};
+
+const sqliteConstructorUnchanged = (
+  reference: t.Node,
+  site: t.Node,
+  bindings: JavaScriptSemanticAnalysisState,
+  index: JavaScriptBindingIndex,
+  moduleWrites: readonly (t.Node | undefined)[],
+): boolean => {
+  const seen = new Set<string>();
+  for (;;) {
+    if (index.referenceMayHaveChangedAt(site, reference)) return false;
+    const binding = index.bindingForReferenceAt(reference);
+    if (binding === undefined || seen.has(binding.bindingId)) return false;
+    seen.add(binding.bindingId);
+    const initial = semanticStableInitializer(binding, bindings);
+    const chain = semanticMemberChain(reference);
+    if (
+      (chain?.members.length ?? 0) > 0 ||
+      (initial?.projection.length ?? 0) > 0
+    ) {
+      const capture =
+        initial !== undefined && initial.projection.length > 0
+          ? initial.node
+          : site;
+      if (
+        evaluateSemanticProvenance(binding, bindings).origins.some(
+          (origin) => origin.specifier === "sqlite3",
+        ) &&
+        moduleWrites.some(
+          (effect) =>
+            semanticEffectTiming(capture, effect, bindings) !== "after",
+        )
+      )
+        return false;
+    }
+    if (binding.kind === "import") return binding.runtimeImport;
+    if (initial === undefined) return false;
+    const value = unwrapJavaScriptExpression(initial.node).node;
+    // Provenance already established the require origin. Alias captures must
+    // additionally retain the constructor identity at their own read site.
+    if (t.isCallExpression(value)) return true;
+    reference = value;
+    site = initial.node;
+  }
+};
+
+const addStorage = (
+  context: FindingContext,
+  node: JavaScriptCallLike,
+  name: string,
+  storage: NonNullable<ReturnType<typeof storageKind>>,
+  first: string | undefined,
+): void => {
   addLocatedFinding(context, {
     collection: context.accumulator.storage,
     key: `storage\0${storage}\0${first ?? ""}`,
